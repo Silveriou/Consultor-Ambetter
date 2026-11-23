@@ -1,0 +1,55 @@
+# ==============================
+# DATOS SENSIBLES - NUNCA SUBIR
+# ==============================
+*.xlsx
+*.xls
+*.csv
+*.env
+.env.*
+*.json
+secrets.toml
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+.env/
+ENV/
+Lib/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
