@@ -87,29 +87,120 @@ def cargar_archivo(archivo):
         df = pd.read_csv(archivo, encoding="utf-8", on_bad_lines="skip")
     else:
         df = pd.read_excel(archivo, engine="openpyxl")
+    return analizar_polizas(df)
+
+
+def analizar_polizas(df_raw):
+    """Calcula estados de deuda, saldo y vigencia de cada póliza."""
+    df = df_raw.copy()
+
+    # 1. Limpieza de Member Responsibility (cuota mensual del cliente)
+    if "Member Responsibility" in df.columns:
+        df["Cuota Mensual ($)"] = (
+            df["Member Responsibility"]
+            .astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df["Cuota Mensual ($)"] = pd.to_numeric(df["Cuota Mensual ($)"], errors="coerce").fillna(0.0)
+    else:
+        df["Cuota Mensual ($)"] = 0.0
+
+    # 2. Parsing de fechas clave
+    for col_f in ["Paid Through Date", "Policy Effective Date", "Policy Term Date"]:
+        if col_f in df.columns:
+            df[f"_{col_f}_dt"] = pd.to_datetime(df[col_f], errors="coerce")
+        else:
+            df[f"_{col_f}_dt"] = pd.NaT
+
+    hoy = pd.Timestamp.now().normalize()
+    primer_dia_mes_actual = pd.Timestamp(year=hoy.year, month=hoy.month, day=1)
+
+    # 3. Cálculo de Estado de Saldo y Deuda
+    def calc_saldo(row):
+        cuota = float(row.get("Cuota Mensual ($)", 0.0))
+        paid_dt = row.get("_Paid Through Date_dt", pd.NaT)
+        eff_dt = row.get("_Policy Effective Date_dt", pd.NaT)
+
+        if cuota == 0.0:
+            return "En Cero ($0 Cuota)", 0.0, "Plan subsidio 100% / Sin costo"
+
+        if pd.isna(paid_dt):
+            # Nunca se registró pago (pago inicial o binder pendiente)
+            deuda = cuota
+            return "Deuda (Pago Inicial Pendiente)", deuda, f"Falta primer pago de ${deuda:,.2f}"
+
+        if paid_dt < primer_dia_mes_actual:
+            # Cuántos meses de atraso
+            meses_atraso = max(1, (hoy.year - paid_dt.year) * 12 + (hoy.month - paid_dt.month))
+            deuda = round(meses_atraso * cuota, 2)
+            return "Con Deuda (Atrasado)", deuda, f"Debe ~${deuda:,.2f} ({meses_atraso} mes(es) sin pagar)"
+        elif paid_dt >= primer_dia_mes_actual + pd.DateOffset(months=1):
+            return "A Favor (Pagado Adelantado)", 0.0, f"Cubierto hasta {paid_dt.strftime('%m/%Y')}"
+        else:
+            return "Al Día (En Cero)", 0.0, "Cuota al día"
+
+    res_saldo = df.apply(calc_saldo, axis=1)
+    df["Estado de Saldo"] = [r[0] for r in res_saldo]
+    df["Monto Deuda Estimada ($)"] = [r[1] for r in res_saldo]
+    df["Detalle de Deuda"] = [r[2] for r in res_saldo]
+
+    # 4. Cálculo de Estatus de Póliza
+    def calc_estatus(row):
+        eff_dt = row.get("_Policy Effective Date_dt", pd.NaT)
+        term_dt = row.get("_Policy Term Date_dt", pd.NaT)
+        paid_dt = row.get("_Paid Through Date_dt", pd.NaT)
+        estado_saldo = row.get("Estado de Saldo", "")
+
+        if pd.isna(eff_dt) and pd.isna(paid_dt):
+            return "Pendiente de Emisión / Binder"
+        if pd.notna(term_dt) and term_dt < hoy:
+            return "Terminada / Expirada"
+        if estado_saldo in ["Con Deuda (Atrasado)", "Deuda (Pago Inicial Pendiente)"]:
+            return "En Período de Gracia (Riesgo)"
+        return "Activa"
+
+    df["Estatus de Póliza"] = df.apply(calc_estatus, axis=1)
+
+    # 5. Nombre Completo
+    if "Insured First Name" in df.columns and "Insured Last Name" in df.columns:
+        df["Cliente"] = (
+            df["Insured First Name"].fillna("").astype(str) + " " +
+            df["Insured Last Name"].fillna("").astype(str)
+        ).str.strip()
+    elif "Insured Last Name" in df.columns:
+        df["Cliente"] = df["Insured Last Name"].fillna("").astype(str)
+    else:
+        df["Cliente"] = "Cliente"
+
     return df
 
 
 def detectar_errores(df):
     """Detecta filas duplicadas y celdas vacías en columnas clave."""
-    duplicados = df[df.duplicated(keep=False)]
-    vacios = df[df.isnull().any(axis=1)]
+    cols_base = [c for c in df.columns if not c.startswith("_")]
+    df_clean = df[cols_base]
+    duplicados = df_clean[df_clean.duplicated(keep=False)]
+    vacios = df_clean[df_clean.isnull().any(axis=1)]
     return duplicados, vacios
 
 
 def convertir_a_excel(df):
     """Convierte un DataFrame a bytes de Excel para descarga."""
+    cols_export = [c for c in df.columns if not c.startswith("_")]
+    df_export = df[cols_export].copy()
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Datos")
-        # Formato de tabla
+        df_export.to_excel(writer, index=False, sheet_name="Datos")
         workbook  = writer.book
         worksheet = writer.sheets["Datos"]
         fmt_header = workbook.add_format({
             "bold": True, "bg_color": "#1a3c5e",
             "font_color": "white", "border": 1
         })
-        for col_num, col_name in enumerate(df.columns):
+        for col_num, col_name in enumerate(df_export.columns):
             worksheet.write(0, col_num, col_name, fmt_header)
             worksheet.set_column(col_num, col_num, max(15, len(str(col_name)) + 4))
     return buffer.getvalue()
@@ -179,45 +270,144 @@ st.markdown("---")
 # ─────────────────────────────────────────────
 duplicados_df, vacios_df = detectar_errores(df)
 total_clientes    = len(df)
-total_columnas    = len(df.columns)
-total_duplicados  = len(df[df.duplicated()])
-total_vacios      = df.isnull().sum().sum()
+total_columnas    = len([c for c in df.columns if not c.startswith("_")])
+total_duplicados  = len(duplicados_df)
+
+con_deuda_mask = df["Estado de Saldo"] == "Con Deuda (Atrasado)"
+pendiente_binder_mask = df["Estado de Saldo"] == "Deuda (Pago Inicial Pendiente)"
+al_dia_mask = df["Estado de Saldo"].isin(["Al Día (En Cero)", "En Cero ($0 Cuota)", "A Favor (Pagado Adelantado)"])
+
+total_con_deuda = int(con_deuda_mask.sum())
+total_pendiente_binder = int(pendiente_binder_mask.sum())
+total_al_dia = int(al_dia_mask.sum())
+monto_deuda_total = float(df["Monto Deuda Estimada ($)"].sum())
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("👥 Total de Clientes",    f"{total_clientes:,}")
-col2.metric("📋 Columnas Detectadas",  f"{total_columnas}")
-col3.metric("🔁 Registros Duplicados", f"{total_duplicados:,}",
-            delta=f"-{total_duplicados}" if total_duplicados > 0 else "✓ Sin duplicados",
-            delta_color="inverse")
-col4.metric("⚠️ Celdas Vacías",        f"{total_vacios:,}",
-            delta=f"-{total_vacios}" if total_vacios > 0 else "✓ Sin vacíos",
-            delta_color="inverse")
+col1.metric("👥 Total de Pólizas", f"{total_clientes:,}")
+col2.metric(
+    "🔴 Con Deuda / Atrasadas",
+    f"{total_con_deuda:,}",
+    delta=f"${monto_deuda_total:,.2f} deuda total" if total_con_deuda > 0 else "Sin deudas",
+    delta_color="inverse"
+)
+col3.metric(
+    "🟡 Pendiente Pago Inicial",
+    f"{total_pendiente_binder:,}",
+    delta="Binder requerido" if total_pendiente_binder > 0 else "Todo emitido",
+    delta_color="off"
+)
+col4.metric(
+    "🟢 Al Día / Cuota $0",
+    f"{total_al_dia:,}",
+    delta=f"{round((total_al_dia / total_clientes) * 100 if total_clientes > 0 else 0)}% del total",
+    delta_color="normal"
+)
 
 st.markdown("---")
 
 # ─────────────────────────────────────────────
 # PESTAÑAS PRINCIPALES
 # ─────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📋 Datos y Filtros", "🚨 Detección de Errores", "💾 Descargar"])
+tab0, tab1, tab2, tab3 = st.tabs([
+    "💰 Saldos, Deudas y Estatus",
+    "📋 Todos los Datos",
+    "🚨 Detección de Errores",
+    "💾 Exportar Reportes"
+])
 
 
 # ══════════════════════════════════════════════
-# TAB 1: DATOS Y FILTROS
+# TAB 0: SALDOS, DEUDAS Y ESTATUS
+# ══════════════════════════════════════════════
+with tab0:
+    st.markdown("### 💳 Control Financiero y Estatus de Pólizas")
+    st.caption("Identifica inmediatamente quién debe, quién está al día y qué pólizas están en riesgo.")
+
+    # Filtros rápidos
+    col_f1, col_f2, col_f3 = st.columns([1.5, 1.5, 2])
+    with col_f1:
+        opciones_saldo = ["(Todos los saldos)"] + sorted(df["Estado de Saldo"].dropna().unique().tolist())
+        filtro_saldo = st.selectbox("🎯 Filtrar por Estado de Saldo:", opciones_saldo)
+    with col_f2:
+        opciones_estatus = ["(Todos los estatus)"] + sorted(df["Estatus de Póliza"].dropna().unique().tolist())
+        filtro_estatus = st.selectbox("🛡️ Filtrar por Estatus de Póliza:", opciones_estatus)
+    with col_f3:
+        filtro_texto_fin = st.text_input("🔍 Buscar cliente, póliza o teléfono:", placeholder="Ej: Perez, U724..., 773...")
+
+    # Aplicar filtros específicos de finanzas
+    df_fin = df.copy()
+    if filtro_saldo != "(Todos los saldos)":
+        df_fin = df_fin[df_fin["Estado de Saldo"] == filtro_saldo]
+    if filtro_estatus != "(Todos los estatus)":
+        df_fin = df_fin[df_fin["Estatus de Póliza"] == filtro_estatus]
+    if filtro_texto_fin:
+        mask_t = df_fin.apply(
+            lambda r: r.astype(str).str.contains(filtro_texto_fin, case=False, na=False).any(),
+            axis=1
+        )
+        df_fin = df_fin[mask_t]
+
+    # Columnas prioritarias para mostrar en la tabla financiera
+    cols_deseadas = [
+        "Cliente",
+        "Policy Number",
+        "Estado de Saldo",
+        "Monto Deuda Estimada ($)",
+        "Cuota Mensual ($)",
+        "Paid Through Date",
+        "Estatus de Póliza",
+        "Autopay",
+        "Member Phone Number",
+        "Member Email",
+        "Plan Name",
+        "State",
+        "County",
+        "Renewal Type"
+    ]
+    cols_existentes = [c for c in cols_deseadas if c in df_fin.columns]
+
+    st.markdown(f"**Mostrando {len(df_fin):,} pólizas filtradas** (Deuda acumulada en esta vista: **${df_fin['Monto Deuda Estimada ($)'].sum():,.2f}**)")
+
+    st.dataframe(
+        df_fin[cols_existentes],
+        use_container_width=True,
+        height=450
+    )
+
+    # Botón directo para descargar los deudores
+    df_deudores = df[df["Estado de Saldo"].isin(["Con Deuda (Atrasado)", "Deuda (Pago Inicial Pendiente)"])]
+    if len(df_deudores) > 0:
+        excel_deudores = convertir_a_excel(df_deudores[cols_existentes])
+        st.download_button(
+            label=f"📥 Descargar lista de cobro ({len(df_deudores)} clientes con deuda o binder pendiente) en Excel",
+            data=excel_deudores,
+            file_name=f"clientes_con_deuda_ambetter_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+
+# ══════════════════════════════════════════════
+# TAB 1: DATOS Y FILTROS GENERALES
 # ══════════════════════════════════════════════
 with tab1:
-    st.markdown("### 🔍 Buscar y Filtrar")
+    st.markdown("### 🔍 Explorador Completo de Datos")
 
     # Buscador global por texto
     busqueda = st.text_input(
-        "🔎 Búsqueda general",
-        placeholder="Escribe cualquier texto para buscar en todos los campos...",
+        "🔎 Búsqueda general en todas las columnas",
+        placeholder="Escribe cualquier texto para buscar...",
+        key="busqueda_tab1"
     )
+
+    # Columnas visibles (excluir internas que empiezan con _)
+    cols_visibles = [c for c in df.columns if not c.startswith("_")]
 
     # Filtros dinámicos por columna
     with st.expander("⚙️ Filtros avanzados por columna", expanded=False):
         filtros = {}
-        cols_filtro = st.columns(min(3, total_columnas))
-        for i, col in enumerate(df.columns[:9]):  # máx 9 columnas para no saturar
+        cols_filtro = st.columns(min(3, len(cols_visibles)))
+        for i, col in enumerate(cols_visibles[:9]):  # máx 9 columnas
             with cols_filtro[i % 3]:
                 try:
                     col_num = pd.to_numeric(df[col], errors="coerce")
@@ -246,10 +436,10 @@ with tab1:
                                 if rango != (min_val, max_val):
                                     filtros[col] = rango
                 except Exception:
-                    pass  # Ignorar columnas con tipos no soportados
+                    pass
 
     # Aplicar búsqueda global
-    df_filtrado = df.copy()
+    df_filtrado = df[cols_visibles].copy()
     if busqueda:
         mask = df_filtrado.apply(
             lambda row: row.astype(str).str.contains(busqueda, case=False, na=False).any(),
@@ -299,7 +489,8 @@ with tab2:
 
     st.markdown("---")
     st.markdown("#### 📊 Resumen de vacíos por columna")
-    vacios_col = df.isnull().sum().reset_index()
+    cols_base = [c for c in df.columns if not c.startswith("_")]
+    vacios_col = df[cols_base].isnull().sum().reset_index()
     vacios_col.columns = ["Columna", "Celdas Vacías"]
     vacios_col = vacios_col[vacios_col["Celdas Vacías"] > 0].sort_values("Celdas Vacías", ascending=False)
 
@@ -314,13 +505,13 @@ with tab2:
 # TAB 3: DESCARGAR
 # ══════════════════════════════════════════════
 with tab3:
-    st.markdown("### 💾 Exportar Datos")
+    st.markdown("### 💾 Exportar Datos y Reportes")
 
     col_d1, col_d2 = st.columns(2)
 
     with col_d1:
-        st.markdown("#### 📥 Datos Filtrados")
-        st.markdown(f"Exportar **{len(df_filtrado):,}** registros con los filtros aplicados.")
+        st.markdown("#### 📥 Datos Filtrados con Cálculos")
+        st.markdown(f"Exportar **{len(df_filtrado):,}** registros con el estado de saldo, deuda y vigencia calculados.")
         excel_filtrado = convertir_a_excel(df_filtrado)
         st.download_button(
             label="⬇️ Descargar datos filtrados (.xlsx)",
@@ -332,8 +523,9 @@ with tab3:
 
     with col_d2:
         st.markdown("#### 🧹 Datos Limpios (sin duplicados ni vacíos)")
-        df_limpio = df.drop_duplicates().dropna()
-        st.markdown(f"Exportar **{len(df_limpio):,}** registros sin errores.")
+        cols_clean = [c for c in df.columns if not c.startswith("_")]
+        df_limpio = df[cols_clean].drop_duplicates().dropna()
+        st.markdown(f"Exportar **{len(df_limpio):,}** registros sin celdas vacías.")
         excel_limpio = convertir_a_excel(df_limpio)
         st.download_button(
             label="⬇️ Descargar datos limpios (.xlsx)",
