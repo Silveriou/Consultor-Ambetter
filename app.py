@@ -219,29 +219,34 @@ with tab1:
         cols_filtro = st.columns(min(3, total_columnas))
         for i, col in enumerate(df.columns[:9]):  # máx 9 columnas para no saturar
             with cols_filtro[i % 3]:
-                if df[col].dtype == object or df[col].nunique() <= 30:
-                    opciones = ["(Todos)"] + sorted(df[col].dropna().astype(str).unique().tolist())
-                    sel = st.selectbox(f"**{col}**", opciones, key=f"filtro_{col}")
-                    if sel != "(Todos)":
-                        filtros[col] = sel
-                else:
-                    col_data = df[col].dropna()
-                    if len(col_data) == 0:
-                        st.caption(f"**{col}**: sin datos")
+                try:
+                    col_num = pd.to_numeric(df[col], errors="coerce")
+                    es_numerico = (df[col].dtype != object) and col_num.notna().any()
+                    if not es_numerico or df[col].nunique() <= 30:
+                        opciones = ["(Todos)"] + sorted(df[col].dropna().astype(str).unique().tolist())
+                        sel = st.selectbox(f"**{col}**", opciones, key=f"filtro_{col}")
+                        if sel != "(Todos)":
+                            filtros[col] = sel
                     else:
-                        min_val = float(col_data.min())
-                        max_val = float(col_data.max())
-                        if min_val == max_val:
-                            st.caption(f"**{col}**: {min_val} (valor único)")
+                        col_data = col_num.dropna()
+                        if len(col_data) == 0:
+                            st.caption(f"**{col}**: sin datos")
                         else:
-                            rango = st.slider(
-                                f"**{col}**",
-                                min_value=min_val, max_value=max_val,
-                                value=(min_val, max_val),
-                                key=f"filtro_{col}"
-                            )
-                            if rango != (min_val, max_val):
-                                filtros[col] = rango
+                            min_val = float(col_data.min())
+                            max_val = float(col_data.max())
+                            if pd.isna(min_val) or pd.isna(max_val) or min_val == max_val:
+                                st.caption(f"**{col}**: {min_val}")
+                            else:
+                                rango = st.slider(
+                                    f"**{col}**",
+                                    min_value=min_val, max_value=max_val,
+                                    value=(min_val, max_val),
+                                    key=f"filtro_{col}"
+                                )
+                                if rango != (min_val, max_val):
+                                    filtros[col] = rango
+                except Exception:
+                    pass  # Ignorar columnas con tipos no soportados
 
     # Aplicar búsqueda global
     df_filtrado = df.copy()
