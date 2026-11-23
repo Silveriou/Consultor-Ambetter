@@ -117,29 +117,42 @@ def analizar_polizas(df_raw):
     hoy = pd.Timestamp.now().normalize()
     primer_dia_mes_actual = pd.Timestamp(year=hoy.year, month=hoy.month, day=1)
 
-    # 3. Cálculo de Estado de Saldo y Deuda
+    # 3. Cálculo de Estado de Saldo y Deuda según reglas de Ambetter
     def calc_saldo(row):
         cuota = float(row.get("Cuota Mensual ($)", 0.0))
         paid_dt = row.get("_Paid Through Date_dt", pd.NaT)
         eff_dt = row.get("_Policy Effective Date_dt", pd.NaT)
+        term_dt = row.get("_Policy Term Date_dt", pd.NaT)
 
+        # Regla 1: Plan sin costo mensual (subsidio 100%)
         if cuota == 0.0:
-            return "En Cero ($0 Cuota)", 0.0, "Plan subsidio 100% / Sin costo"
+            return "En Cero ($0 Cuota)", 0.0, "Plan con subsidio 100% / Sin costo mensual"
 
+        # Regla 2: Si nunca se registró pago inicial (Binder)
         if pd.isna(paid_dt):
-            # Nunca se registró pago (pago inicial o binder pendiente)
-            deuda = cuota
-            return "Deuda (Pago Inicial Pendiente)", deuda, f"Falta primer pago de ${deuda:,.2f}"
+            return "Deuda (Pago Inicial Pendiente)", cuota, f"Falta primer pago de ${cuota:,.2f} para activar póliza"
 
-        if paid_dt < primer_dia_mes_actual:
-            # Cuántos meses de atraso
-            meses_atraso = max(1, (hoy.year - paid_dt.year) * 12 + (hoy.month - paid_dt.month))
-            deuda = round(meses_atraso * cuota, 2)
-            return "Con Deuda (Atrasado)", deuda, f"Debe ~${deuda:,.2f} ({meses_atraso} mes(es) sin pagar)"
-        elif paid_dt >= primer_dia_mes_actual + pd.DateOffset(months=1):
-            return "A Favor (Pagado Adelantado)", 0.0, f"Cubierto hasta {paid_dt.strftime('%m/%Y')}"
-        else:
-            return "Al Día (En Cero)", 0.0, "Cuota al día"
+        # Regla 3: Si Paid Through Date es IGUAL o MAYOR a Policy Term Date
+        # ¡La póliza fue pagada completamente durante toda su vigencia! Saldo $0.00 exacto
+        if pd.notna(term_dt) and paid_dt >= term_dt:
+            return "Al Día (En Cero)", 0.0, f"Pagada al 100% hasta fin de vigencia ({paid_dt.strftime('%m/%d/%Y')})"
+
+        # Regla 4: Pólizas vigentes que están al día o adelantadas
+        if paid_dt >= primer_dia_mes_actual:
+            if paid_dt >= primer_dia_mes_actual + pd.DateOffset(months=1):
+                return "A Favor (Pagado Adelantado)", 0.0, f"Cubierto por adelantado hasta {paid_dt.strftime('%m/%d/%Y')}"
+            else:
+                return "Al Día (En Cero)", 0.0, f"Cuota al día (pagado hasta {paid_dt.strftime('%m/%d/%Y')})"
+
+        # Regla 5: Póliza que terminó en el pasado
+        limite_cobro = term_dt if (pd.notna(term_dt) and term_dt < primer_dia_mes_actual) else primer_dia_mes_actual
+        if paid_dt >= limite_cobro:
+            return "Al Día (En Cero)", 0.0, f"Pagada completamente hasta fin de vigencia ({paid_dt.strftime('%m/%d/%Y')})"
+
+        # Si realmente quedó debiendo meses de vigencia activa
+        meses_atraso = max(1, (limite_cobro.year - paid_dt.year) * 12 + (limite_cobro.month - paid_dt.month))
+        deuda = round(meses_atraso * cuota, 2)
+        return "Con Deuda (Atrasado)", deuda, f"Debe ~${deuda:,.2f} ({meses_atraso} mes(es) pendientes)"
 
     res_saldo = df.apply(calc_saldo, axis=1)
     df["Estado de Saldo"] = [r[0] for r in res_saldo]
