@@ -225,16 +225,23 @@ with tab1:
                     if sel != "(Todos)":
                         filtros[col] = sel
                 else:
-                    min_val = float(df[col].min())
-                    max_val = float(df[col].max())
-                    rango = st.slider(
-                        f"**{col}**",
-                        min_value=min_val, max_value=max_val,
-                        value=(min_val, max_val),
-                        key=f"filtro_{col}"
-                    )
-                    if rango != (min_val, max_val):
-                        filtros[col] = rango
+                    col_data = df[col].dropna()
+                    if len(col_data) == 0:
+                        st.caption(f"**{col}**: sin datos")
+                    else:
+                        min_val = float(col_data.min())
+                        max_val = float(col_data.max())
+                        if min_val == max_val:
+                            st.caption(f"**{col}**: {min_val} (valor único)")
+                        else:
+                            rango = st.slider(
+                                f"**{col}**",
+                                min_value=min_val, max_value=max_val,
+                                value=(min_val, max_val),
+                                key=f"filtro_{col}"
+                            )
+                            if rango != (min_val, max_val):
+                                filtros[col] = rango
 
     # Aplicar búsqueda global
     df_filtrado = df.copy()
